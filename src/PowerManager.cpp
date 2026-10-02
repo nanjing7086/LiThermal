@@ -10,7 +10,21 @@
 #include <unistd.h>  // write(), read(), close()
 #include <sys/select.h>
 
-static int serial_fd = 0;
+static int serial_fd = -1;
+
+/*
+ * The STC8 returns battery voltage in millivolts.  Set these at build time
+ * after comparing the display with a multimeter:
+ *   displayed = raw * BATTERY_VOLTAGE_SCALE_PERMILLE / 1000
+ *             + BATTERY_VOLTAGE_OFFSET_MV
+ */
+#ifndef BATTERY_VOLTAGE_SCALE_PERMILLE
+#define BATTERY_VOLTAGE_SCALE_PERMILLE 1000
+#endif
+#ifndef BATTERY_VOLTAGE_OFFSET_MV
+#define BATTERY_VOLTAGE_OFFSET_MV 0
+#endif
+
 int serialSetup()
 {
     int serial_port;
@@ -32,6 +46,7 @@ int serialSetup()
     if (tcgetattr(serial_port, &tty) != 0)
     {
         printf("Error %i from tcgetattr: %s\n", errno, strerror(errno));
+        close(serial_port);
         return -1;
     }
     tty.c_iflag &= ~(IGNBRK | BRKINT | ICRNL |
@@ -67,6 +82,7 @@ int serialSetup()
     if (tcsetattr(serial_port, TCSAFLUSH, &tty) != 0)
     {
         printf("Error %i from tcsetattr: %s\n", errno, strerror(errno));
+        close(serial_port);
         return -1;
     }
     tcflush(serial_port, TCIOFLUSH); // Flush serial buffer
@@ -75,11 +91,40 @@ int serialSetup()
 
 static int serialWrite(int fd, uint8_t command)
 {
+    if (fd < 0)
+        return 0;
     int len;
     len = write(fd, &command, 1);
     if (len < 0)
         return 0;
     return 1;
+}
+
+static bool serialReadExact(uint8_t *buf, size_t size)
+{
+    if (serial_fd < 0)
+        return false;
+
+    size_t received = 0;
+    while (received < size)
+    {
+        fd_set set;
+        struct timeval timeout;
+        FD_ZERO(&set);
+        FD_SET(serial_fd, &set);
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 100000;
+
+        int select_result = select(serial_fd + 1, &set, NULL, NULL, &timeout);
+        if (select_result <= 0)
+            return false;
+
+        ssize_t len = read(serial_fd, buf + received, size - received);
+        if (len <= 0)
+            return false;
+        received += (size_t)len;
+    }
+    return true;
 }
 
 #define SERIAL_CMD_READ_ADC 0x58
@@ -91,57 +136,34 @@ static int serialWrite(int fd, uint8_t command)
 
 int16_t PowerManager_getBatteryVoltage()
 {
-    char buf[2];
-    int len = -1;
-    int16_t result = 0;
-    serialWrite(serial_fd, SERIAL_CMD_READ_ADC);
-    tcflush(serial_fd, TCIOFLUSH); // Flush serial buffer
-    /*author: https://stackoverflow.com/a/2918709 */
-    fd_set set;
-    struct timeval timeout;
-    FD_ZERO(&set);           /* clear the set */
-    FD_SET(serial_fd, &set); /* add our file descriptor to the set */
-    timeout.tv_sec = 0;
-    timeout.tv_usec = 100000;
-
-    int select_result = select(serial_fd + 1, &set, NULL, NULL, &timeout);
-    if (select_result == -1)
-        return -1; /* an error accured */
-    else if (select_result == 0)
-        return -1; /* a timeout occured */
-    else
-        len = read(serial_fd, buf, 2);
-
-    if (len < 0)
+    uint8_t buf[2];
+    if (serial_fd < 0)
         return -1;
-    result = buf[0];
-    result <<= 8;
-    result |= buf[1];
-    return result;
+
+    /* Drop stale reply bytes only.  TCIOFLUSH here can discard the command. */
+    tcflush(serial_fd, TCIFLUSH);
+    if (!serialWrite(serial_fd, SERIAL_CMD_READ_ADC) || !serialReadExact(buf, 2))
+        return -1;
+
+    int32_t voltage = ((int32_t)buf[0] << 8) | buf[1];
+    voltage = voltage * BATTERY_VOLTAGE_SCALE_PERMILLE / 1000 + BATTERY_VOLTAGE_OFFSET_MV;
+    if (voltage < 0)
+        voltage = 0;
+    if (voltage > INT16_MAX)
+        voltage = INT16_MAX;
+    return (int16_t)voltage;
 }
 
 bool PowerManager_isCharging()
 {
-    char buf = 0;
-    serialWrite(serial_fd, SERIAL_CMD_IS_CHARGING);
-    // tcflush(serial_fd, TCIOFLUSH); // Flush serial buffer
-    /*author: https://stackoverflow.com/a/2918709 */
-    fd_set set;
-    struct timeval timeout;
-    FD_ZERO(&set);           /* clear the set */
-    FD_SET(serial_fd, &set); /* add our file descriptor to the set */
-    timeout.tv_sec = 0;
-    timeout.tv_usec = 100000;
+    uint8_t buf = 0;
+    if (serial_fd < 0)
+        return false;
 
-    int select_result = select(serial_fd + 1, &set, NULL, NULL, &timeout);
-    if (select_result == -1)
-        return false; /* an error accured */
-    else if (select_result == 0)
-        return false; /* a timeout occured */
-    else
-        read(serial_fd, &buf, 1);
-
-    return (buf == 1);
+    tcflush(serial_fd, TCIFLUSH);
+    if (!serialWrite(serial_fd, SERIAL_CMD_IS_CHARGING) || !serialReadExact(&buf, 1))
+        return false;
+    return buf == 1;
 }
 
 void PowerManager_init()
@@ -152,7 +174,7 @@ void PowerManager_init()
 #include <signal.h>
 void PowerManager_powerOff()
 {
-    if (serial_fd <= 0)
+    if (serial_fd < 0)
         return;
     serialWrite(serial_fd, SERIAL_CMD_POWEROFF);
     system("echo 1 > /tmp/poweroff");
